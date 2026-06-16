@@ -243,7 +243,12 @@ def save_pos_day(date, total_incl_gst, doordash=0.0, ubereats=0.0,
 
 # ---------------- drinks order counts (persisted fridge count) ----------------
 def load_drinks_counts() -> dict:
-    rows = sb_client().table("drinks_counts").select("*").execute().data or []
+    # Degrade to empty if the table doesn't exist yet (DB created before this table was
+    # added) so the Ordering tab still loads; re-run schema.sql to enable saving counts.
+    try:
+        rows = sb_client().table("drinks_counts").select("*").execute().data or []
+    except Exception:
+        return {}
     return {r["item"]: float(r.get("on_hand") or 0) for r in rows}
 
 

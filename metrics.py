@@ -321,6 +321,19 @@ def order_guide(lines, pos_df, classifier, supplier, period_col_, period_key, gr
     return df, n_weeks
 
 
+def order_guide_levels(lines, pos_df, classifier, supplier, levels):
+    """Reference table: aimed quantity per item at various weekly sales levels
+    (aimed = usage rate x level). One row per item, a column per sales level."""
+    rate, _, _ = usage_rate_per_1000(lines, pos_df, classifier, supplier)
+    rows = []
+    for lab, r in sorted(rate.items(), key=lambda kv: -kv[1]):
+        row = {"Item": lab}
+        for lv in levels:
+            row[f"${int(lv / 1000)}k"] = round(r * lv / 1000, 1)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def category_weekly_spend(df, category, n=8):
     """[Week, Spend] ex-GST for a category over the most recent n ISO weeks (trend)."""
     if df is None or df.empty or "iso_week" not in df:

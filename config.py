@@ -195,6 +195,33 @@ def baida_recommended(weekly_sales):
     return (float(g[-1][1]), float(g[-1][2]))
 
 
+# ---- Baida cut tracking (order guide: aimed vs actual per cut) ----
+# Finer than TUB_TYPES (whole vs split tubs): buckets each Baida line into the cut it is,
+# for the Ordering → Baida aimed-vs-actual guide. Real lines look like
+# "FRESH RSPCA CHICKEN CHARCOAL BULK SZ 16 CRTE", "...SPLIT CHICKEN 1.1KG CRT",
+# "...DRUMSTICKS BULK 12KG", "...CHICKEN STRIPS/TLOIN...", "...FLATTENED FOB 171-190G"
+# (large) / "...FOB 95-125G" (small). Specific cuts win over generic.
+def baida_cut(description) -> str | None:
+    """Bucket a Baida line into a cut: Whole/Charcoal | Split | Drums | Strips | Flat-L |
+    Flat-S. None for non-cut lines (e.g. the TUB DEPOSIT)."""
+    d = (description or "").lower()
+    if "split" in d:
+        return "Split"
+    if "charcoal" in d or "whole" in d:
+        return "Whole/Charcoal"
+    if "drumstick" in d:
+        return "Drums"
+    if "strip" in d or "tloin" in d or "tenderloin" in d:
+        return "Strips"
+    if "flattened" in d or "flat" in d:
+        if "171" in d or "190" in d:
+            return "Flat-L"
+        if "95" in d or "125" in d or "11.2" in d:
+            return "Flat-S"
+        return "Flat"
+    return None
+
+
 # ---- Veggie price tracker ----
 # The category whose line-item prices the Veggie tab tracks over time. The tracker groups
 # by the (normalised) line description, so it needs no per-item list — it learns the items

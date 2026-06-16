@@ -818,7 +818,7 @@ with tab_order:
     _inv = c_invoices()
     _pos = c_pos_days()
     _lines = metrics.explode_lines(_inv)
-    o_dr, o_bs = st.tabs(["🥤 Drinks", f"🐟 {config.BLUESEAS_SUPPLIER}"])
+    o_dr, o_ba, o_bs = st.tabs(["🥤 Drinks", "🍗 Baida", f"🐟 {config.BLUESEAS_SUPPLIER}"])
 
     # ---- Blueseas: usage learned from history → recommended order + over-order flags ----
     with o_bs:
@@ -869,6 +869,53 @@ with tab_order:
                 fig.update_xaxes(title="")
                 st.plotly_chart(_bare_fig(fig, 240), use_container_width=True,
                                 config={"displayModeBar": False})
+
+    # ---- Baida: aimed-vs-actual per cut, learned from sales (like the main app) ----
+    with o_ba:
+        st.caption("Aimed = your typical usage per cut scaled to the period's sales; Actual = "
+                   "what was ordered. Develops as takings + Baida invoices build up.")
+        levels = [s for s, _, _ in config.BAIDA_ORDER_GUIDE]
+        gross_period = (float(pd.to_numeric(_pos[_pos[p_col] == period_key]["total_incl_gst"],
+                                            errors="coerce").fillna(0).sum())
+                        if (not _pos.empty and p_col in _pos) else 0.0)
+        using_avg = False
+        if gross_period <= 0:
+            gross_period = metrics.recent_avg_weekly_sales(_pos)
+            using_avg = gross_period > 0
+        g, nwk = metrics.order_guide(_lines, _pos, config.baida_cut, config.BAIDA_SUPPLIER,
+                                     p_col, period_key, gross_period)
+        st.markdown(f"**🍗 Baida — aimed vs actual ({period_label})**")
+        if nwk < 6:
+            st.caption(f"📈 Only {nwk} week(s) of sales + invoice history so far — treat **aimed** "
+                       "as indicative; it sharpens as more weeks of takings build up.")
+        if g.empty:
+            st.info("No Baida order lines for this period yet — upload chicken invoices in 📸 Add invoice.")
+        else:
+            if using_avg:
+                st.caption(f"No takings entered for this {mode.lower()} yet — **aimed** uses your "
+                           f"average sales week (~${gross_period:,.0f} gross incl GST).")
+            else:
+                st.caption(f"**Aimed** = typical usage scaled to this {mode.lower()}'s sales "
+                           f"(~${gross_period:,.0f} gross incl GST). **Actual** = what was ordered.")
+            _m = g.melt(id_vars="Item", value_vars=["Aimed", "Actual"],
+                        var_name="Type", value_name="Qty")
+            fig = px.bar(_m, x="Item", y="Qty", color="Type", barmode="group",
+                         color_discrete_map={"Aimed": "#8b95a7", "Actual": T["accent"]})
+            st.plotly_chart(_bare_fig(fig, 320), use_container_width=True,
+                            config={"displayModeBar": False})
+            over = g[(g["Diff"] > 0) & (g["~$ over"] > 0)]
+            if not over.empty:
+                st.warning(f"🔴 Likely over-ordered ~${float(over['~$ over'].sum()):,.0f} this "
+                           f"{mode.lower()} across {len(over)} cut(s) — trim these next order.")
+            st.dataframe(g, hide_index=True, use_container_width=True)
+            st.caption("Diff = Actual − Aimed (positive = over). ~$ over = Diff × last unit price.")
+        with st.expander("📋 Baida order guide — aimed quantity at various weekly sales"):
+            ref = metrics.order_guide_levels(_lines, _pos, config.baida_cut,
+                                             config.BAIDA_SUPPLIER, levels)
+            if ref.empty:
+                st.caption("Builds once there's sales + Baida invoice history.")
+            else:
+                st.dataframe(ref, hide_index=True, use_container_width=True)
 
     # ---- Drinks: per-week pars scaled to the delivery window, less on-hand ----
     with o_dr:

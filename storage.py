@@ -7,6 +7,7 @@ running schema.sql in the Supabase SQL editor (see SETUP.md).
 import os
 import json
 import math
+import base64
 import datetime as dt
 import pandas as pd
 import config
@@ -140,6 +141,79 @@ def delete_invoice(saved_at: str):
     sb = sb_client()
     sb.table("invoices").delete().eq("saved_at", saved_at).execute()
     sb.table("invoice_images").delete().eq("saved_at", saved_at).execute()
+
+
+def find_duplicate(supplier, invoice_date, total_ex_gst):
+    """First already-saved invoice matching canonical supplier + date + total (to the
+    cent), else None. Used to warn before saving a re-upload."""
+    df = load_invoices()
+    if df.empty:
+        return None
+    try:
+        d = pd.to_datetime(invoice_date).date().isoformat()
+    except Exception:
+        return None
+    tot = round(float(total_ex_gst), 2)
+    m = df[(df["supplier"] == supplier)
+           & (df["invoice_date"].astype(str) == d)
+           & (pd.to_numeric(df["total_ex_gst"], errors="coerce").round(2) == tot)]
+    return m.iloc[0].to_dict() if not m.empty else None
+
+
+def duplicate_groups(df):
+    """Groups of invoices sharing supplier + date + total (>1 copy), each oldest-first."""
+    if df is None or df.empty:
+        return []
+    g = df.copy()
+    g["_tot"] = pd.to_numeric(g["total_ex_gst"], errors="coerce").round(2)
+    out = []
+    for _, sub in g.groupby(["supplier", "invoice_date", "_tot"]):
+        if len(sub) > 1:
+            out.append(sub.sort_values("saved_at"))
+    return out
+
+
+def load_invoice_images(saved_at):
+    """All stored pages for an invoice as a list of (bytes, media_type), or []. Handles
+    both a single raw-base64 string (this app's format) and a JSON array of pages."""
+    try:
+        data = (sb_client().table("invoice_images").select("*")
+                .eq("saved_at", str(saved_at)).execute().data)
+    except Exception:
+        return []
+    if not data:
+        return []
+    r = data[0]
+    raw = r.get("image_b64")
+    if not isinstance(raw, str) or not raw.strip():
+        return []
+    s = raw.strip()
+    if s.startswith("["):
+        try:
+            return [(base64.b64decode(p["b64"]), p.get("media_type") or "image/jpeg")
+                    for p in json.loads(s) if p.get("b64")]
+        except Exception:
+            return []
+    try:
+        return [(base64.b64decode(s), r.get("media_type") or "image/jpeg")]
+    except Exception:
+        return []
+
+
+def update_invoice(old_saved_at, supplier_raw, invoice_date, total_ex_gst, line_items):
+    """Correct an invoice: re-save the fixed values (re-deriving the category) and carry
+    the original photo across so 'View original' still works after an edit."""
+    img_b64 = img_mt = None
+    try:
+        data = (sb_client().table("invoice_images").select("*")
+                .eq("saved_at", str(old_saved_at)).execute().data)
+        if data:
+            img_b64, img_mt = data[0].get("image_b64"), data[0].get("media_type")
+    except Exception:
+        pass
+    delete_invoice(old_saved_at)
+    return save_invoice(supplier_raw, invoice_date, total_ex_gst, line_items,
+                        image_b64=img_b64, media_type=img_mt)
 
 
 # ---------------- daily takings ----------------

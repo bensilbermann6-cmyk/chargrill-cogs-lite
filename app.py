@@ -9,6 +9,7 @@ Setup (per store): see SETUP.md. Secrets: APP_PASSWORD, SUPABASE_URL, SUPABASE_K
 ANTHROPIC_API_KEY.
 """
 import os
+import json
 import base64
 import datetime as dt
 from string import Template
@@ -222,7 +223,13 @@ def c_pos_days():
     return storage.load_pos_days()
 
 
+@st.cache_data(ttl=120)
+def c_invoice_images(saved_at):
+    return storage.load_invoice_images(saved_at)
+
+
 def bust():
+    c_invoice_images.clear()
     c_invoices.clear()
     c_pos_days.clear()
     config.bust_cache()
@@ -438,6 +445,11 @@ with tab_inv:
                                    step=0.01, format="%.2f")
         if d.get("confidence") and d["confidence"] != "high":
             st.warning(f"Read confidence: {d['confidence']} — double-check the figures above.")
+        _dup = storage.find_duplicate(category, inv_date, float(total_ex))
+        if _dup:
+            st.warning(f"⚠️ Possible duplicate — already saved **{_dup['invoice_date']} · "
+                       f"{_dup['supplier_raw']} · ${float(_dup['total_ex_gst']):,.2f}**. "
+                       "Save again only if this is a different invoice.")
 
         li = d.get("line_items") or []
         edited_li = None
@@ -558,29 +570,196 @@ with tab_pos:
 
 # ============================ Invoices list ============================
 with tab_list:
-    st.markdown("#### 📋 All invoices")
+    st.markdown("#### 📋 Invoices")
     inv = c_invoices()
     if inv.empty:
-        st.info("No invoices yet.")
+        st.info("No invoices yet — add one in **📸 Add invoice**.")
     else:
-        catopts = ["(all)"] + sorted(inv["supplier"].dropna().unique().tolist())
-        f = st.selectbox("Supplier", catopts)
-        view = (inv if f == "(all)" else inv[inv["supplier"] == f]).sort_values("invoice_date", ascending=False)
-        show = view[["invoice_date", "supplier", "supplier_raw", "total_ex_gst"]].rename(columns={
-            "invoice_date": "Date", "supplier": "Category", "supplier_raw": "Supplier (printed)",
-            "total_ex_gst": "Ex-GST"})
-        st.dataframe(show, hide_index=True, use_container_width=True)
-        st.caption(f"{len(view)} invoices · ${view['total_ex_gst'].sum():,.0f} ex-GST total")
-        with st.expander("Delete an invoice"):
-            opts = {f"{r.invoice_date} · {r.supplier_raw} · ${r.total_ex_gst:,.2f}": r.saved_at
-                    for r in view.itertuples()}
-            if opts:
-                pick = st.selectbox("Invoice", list(opts.keys()))
-                if st.button("🗑️ Delete"):
-                    storage.delete_invoice(opts[pick])
+        # ---- filters ----
+        fc = st.columns([1.2, 1.8, 1, 1])
+        cats = ["All categories"] + [s["category"] for s in config.suppliers()]
+        pick = fc[0].selectbox("Category", cats, key="invlist_cat")
+        q = fc[1].text_input("Search supplier or item", key="invlist_q",
+                             placeholder="e.g. chicken, st george…").strip().lower()
+        _alld = pd.to_datetime(inv["invoice_date"], errors="coerce")
+        _lo = _alld.min().date() if pd.notna(_alld.min()) else dt.date.today()
+        _hi = _alld.max().date() if pd.notna(_alld.max()) else dt.date.today()
+        d_from = fc[2].date_input("From", value=_lo)
+        d_to = fc[3].date_input("To", value=_hi)
+
+        view = inv if pick == "All categories" else inv[inv["supplier"] == pick]
+        _vd = pd.to_datetime(view["invoice_date"], errors="coerce").dt.date
+        view = view[(_vd >= d_from) & (_vd <= d_to)]
+        if q:
+            view = view[view["supplier_raw"].astype(str).str.lower().str.contains(q, na=False)
+                        | view["line_items"].astype(str).str.lower().str.contains(q, na=False)]
+        view = view.assign(_sortd=pd.to_datetime(view["invoice_date"], errors="coerce"))
+        view = view.sort_values(["_sortd", "saved_at"], ascending=False)
+        st.caption(f"{len(view)} invoice(s) · "
+                   f"${pd.to_numeric(view['total_ex_gst'], errors='coerce').sum():,.0f} ex-GST")
+        view = view.assign(_wkstart=view["_sortd"].dt.normalize()
+                           - pd.to_timedelta(view["_sortd"].dt.weekday, unit="D"))
+
+        def _show_table(_df):
+            t = _df[["invoice_date", "supplier_raw", "supplier", "total_ex_gst"]].rename(columns={
+                "invoice_date": "Date", "supplier_raw": "Supplier (as invoiced)",
+                "supplier": "Category", "total_ex_gst": "Total ex-GST $"})
+            t["Date"] = pd.to_datetime(t["Date"], errors="coerce")
+            t["Total ex-GST $"] = pd.to_numeric(t["Total ex-GST $"], errors="coerce")
+            st.dataframe(t, hide_index=True, use_container_width=True, column_config={
+                "Date": st.column_config.DateColumn("Date", format="DD/MM/YYYY"),
+                "Total ex-GST $": st.column_config.NumberColumn("Total ex-GST $", format="$%.2f")})
+
+        # ---- group by week ----
+        if view.empty:
+            st.info("No invoices match the current filter.")
+        else:
+            by_week = st.toggle("📅 Group by week", value=True, key="invlist_byweek")
+            if by_week:
+                def _week_exp(w, expanded):
+                    wk = view[view["_wkstart"] == w]
+                    ws = pd.Timestamp(w).date()
+                    we = ws + dt.timedelta(days=6)
+                    wt = pd.to_numeric(wk["total_ex_gst"], errors="coerce").sum()
+                    with st.expander(f"Week of {ws:%d %b} – {we:%d %b %Y}  ·  {len(wk)} invoice(s)"
+                                     f"  ·  ${wt:,.0f} ex-GST", expanded=expanded):
+                        _show_table(wk)
+                weeks = sorted(view["_wkstart"].dropna().unique(), reverse=True)
+                for _i, w in enumerate(weeks[:3]):
+                    _week_exp(w, expanded=(_i == 0))
+                if len(weeks) > 3 and st.toggle(f"📂 Show older weeks ({len(weeks)-3} more)",
+                                                value=False, key="invlist_more"):
+                    for w in weeks[3:]:
+                        _week_exp(w, expanded=False)
+                stray = view[view["_wkstart"].isna()]
+                if not stray.empty:
+                    with st.expander(f"⚠️ Undated · {len(stray)} invoice(s)"):
+                        _show_table(stray)
+            else:
+                _show_table(view)
+
+            # ---- line items ----
+            with st.expander("🔍 View line items"):
+                for _, r in view.iterrows():
+                    st.markdown(f"**{r['invoice_date']} · {r['supplier_raw']}** → {r['supplier']} · "
+                                f"${float(r['total_ex_gst']):,.2f} ex-GST")
+                    raw = r.get("line_items")
+                    if isinstance(raw, str) and raw.strip():
+                        try:
+                            items = json.loads(raw)
+                            if items:
+                                st.table(pd.DataFrame(items))
+                        except Exception:
+                            pass
+
+        # ---- duplicate check ----
+        st.divider()
+        with st.expander("🔁 Duplicate check — same supplier, date & total"):
+            groups = storage.duplicate_groups(inv)
+            if not groups:
+                st.success("No duplicates detected.")
+            else:
+                st.warning(f"{len(groups)} possible duplicate group(s).")
+                for i, grp in enumerate(groups):
+                    r0 = grp.iloc[0]
+                    st.markdown(f"**{r0['supplier']}** · {r0['invoice_date']} · "
+                                f"${float(r0['total_ex_gst']):,.2f} — {len(grp)} copies")
+                    st.dataframe(grp[["invoice_date", "supplier_raw", "total_ex_gst", "saved_at"]],
+                                 hide_index=True, use_container_width=True)
+                    if st.button(f"Remove {len(grp)-1} duplicate(s), keep earliest", key=f"dedup{i}"):
+                        for sa in grp["saved_at"].astype(str).tolist()[1:]:
+                            storage.delete_invoice(sa)
+                        bust()
+                        st.success(f"Removed {len(grp)-1} duplicate(s).")
+                        st.rerun()
+
+        # ---- view original ----
+        st.divider()
+        with st.expander("📷 View original invoice photo / PDF"):
+            if view.empty:
+                st.caption("No invoices match the current filter.")
+            else:
+                labels = {str(r["saved_at"]): f"{r['invoice_date']} · {r['supplier_raw']} · "
+                                              f"${float(r['total_ex_gst']):,.2f}"
+                          for _, r in view.iterrows()}
+                psel = st.selectbox("Invoice", list(labels), format_func=lambda s: labels[s], key="photo_sel")
+                imgs = c_invoice_images(psel)
+                if not imgs:
+                    st.caption("No photo stored for this invoice.")
+                else:
+                    n = len(imgs)
+                    for _i, (_b, _mt) in enumerate(imgs, 1):
+                        lbl = labels[psel] if n == 1 else f"{labels[psel]} — page {_i}/{n}"
+                        if (_mt or "").startswith("image/"):
+                            st.image(_b, caption=lbl, use_container_width=True)
+                        else:
+                            st.download_button(
+                                f"⬇️ Download original (PDF){'' if n == 1 else f' — page {_i}'}", _b,
+                                key=f"photo_dl_{_i}",
+                                file_name=f"invoice_{psel[:16].replace(':', '-')}_{_i}.pdf",
+                                mime=_mt or "application/pdf")
+
+        # ---- edit / fix ----
+        st.divider()
+        with st.expander("✏️ Edit / fix an invoice"):
+            if view.empty:
+                st.caption("No invoices match the current filter.")
+            else:
+                elabels = {str(r["saved_at"]): f"{r['invoice_date']} · {r['supplier_raw']} · "
+                                               f"${float(r['total_ex_gst']):,.2f}"
+                           for _, r in view.iterrows()}
+                esel = st.selectbox("Pick an invoice to correct", list(elabels),
+                                    format_func=lambda s: elabels[s], key="edit_sel")
+                erow = inv[inv["saved_at"].astype(str) == esel].iloc[0]
+                ec = st.columns(3)
+                e_sup = ec[0].text_input("Supplier (as invoiced)", value=str(erow["supplier_raw"]), key="edit_sup")
+                try:
+                    _ed = pd.to_datetime(erow["invoice_date"]).date()
+                except Exception:
+                    _ed = dt.date.today()
+                e_date = ec[1].date_input("Invoice date", value=_ed, key="edit_date")
+                e_total = ec[2].number_input("Total ex-GST $", min_value=0.0, step=1.0,
+                                             value=float(erow["total_ex_gst"]), key="edit_total")
+                st.caption(f"Category re-derives from the supplier name → **{config.canonicalize(e_sup)}**")
+                try:
+                    _items = (json.loads(erow["line_items"])
+                              if isinstance(erow["line_items"], str) and erow["line_items"].strip() else [])
+                except Exception:
+                    _items = []
+                _idf = pd.DataFrame(_items)
+                for _c in ["description", "quantity", "unit", "unit_price", "amount"]:
+                    if _c not in _idf.columns:
+                        _idf[_c] = None
+                _idf = _idf[["description", "quantity", "unit", "unit_price", "amount"]]
+                edf = st.data_editor(_idf, num_rows="dynamic", hide_index=True,
+                                     use_container_width=True, key="edit_items")
+                if st.button("💾 Save corrections", type="primary", key="edit_save"):
+                    new_items = [{"description": r["description"], "quantity": r["quantity"],
+                                  "unit": r["unit"], "unit_price": r["unit_price"], "amount": r["amount"]}
+                                 for _, r in edf.iterrows()
+                                 if str(r.get("description") or "").strip() or pd.notna(r.get("amount"))]
+                    storage.update_invoice(esel, e_sup, e_date.isoformat(), float(e_total), new_items)
                     bust()
-                    st.success("Deleted.")
+                    st.success(f"Updated: {e_date} · {e_sup}")
                     st.rerun()
+
+        # ---- delete ----
+        st.divider()
+        st.markdown("**🗑️ Delete an invoice** (permanent)")
+        dlabels = {str(r["saved_at"]): f"{r['invoice_date']} · {r['supplier_raw']} · "
+                                       f"${float(r['total_ex_gst']):,.2f}"
+                   for _, r in view.iterrows()}
+        if dlabels:
+            chosen = st.selectbox("Invoice to delete", list(dlabels),
+                                  format_func=lambda s: dlabels.get(s, s), key="del_sel")
+            confirm = st.checkbox("Yes, permanently delete this invoice", key="del_confirm")
+            if st.button("Delete invoice", key="del_btn", disabled=not confirm):
+                storage.delete_invoice(chosen)
+                bust()
+                st.success("Deleted.")
+                st.rerun()
+        else:
+            st.caption("No invoices match the current filter.")
 
 
 # ============================ Settings ============================

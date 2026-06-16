@@ -280,13 +280,7 @@ with tab_set:
             "sort_order": st.column_config.NumberColumn("Order", format="%d"),
         }, key="sup_editor")
     if st.button("💾 Save categories", type="primary"):
-        rows = []
-        for r in edited.to_dict("records"):
-            if not (r.get("category") or "").strip():
-                continue
-            r["aliases"] = [a.strip() for a in str(r.get("aliases") or "").split(",") if a.strip()]
-            rows.append(r)
-        storage.save_suppliers(rows)
+        storage.save_suppliers(edited.to_dict("records"))
         bust()
         st.success("Categories saved.")
         st.rerun()

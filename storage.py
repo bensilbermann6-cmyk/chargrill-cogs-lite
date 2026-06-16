@@ -6,6 +6,7 @@ running schema.sql in the Supabase SQL editor (see SETUP.md).
 """
 import os
 import json
+import math
 import datetime as dt
 import pandas as pd
 import config
@@ -44,25 +45,44 @@ def load_suppliers() -> list:
     return rows
 
 
+def _num_or_none(v):
+    """Float, or None for blanks/NaN. The Settings number cells come back as NaN when
+    empty, and Postgrest's JSON encoder rejects NaN (allow_nan=False) — so coerce here."""
+    try:
+        if v is None:
+            return None
+        f = float(v)
+        return None if math.isnan(f) else f
+    except (TypeError, ValueError):
+        return None
+
+
 def save_suppliers(rows: list):
-    """Replace the whole supplier table with `rows` (the Settings grid's contents)."""
+    """Replace the whole supplier table with `rows` (the Settings grid's contents).
+    Tolerates either list or comma-string aliases, and NaN/blank numeric cells."""
     sb = sb_client()
     sb.table("suppliers").delete().neq("category", "\x00__none__").execute()
     payload = []
     for i, r in enumerate(rows):
-        cat = (r.get("category") or "").strip()
+        cat = r.get("category")
+        cat = cat.strip() if isinstance(cat, str) else ""
         if not cat:
             continue
         aliases = r.get("aliases")
         if isinstance(aliases, list):
             aliases = ",".join(str(x).strip() for x in aliases if str(x).strip())
+        elif isinstance(aliases, str):
+            aliases = ",".join(a.strip() for a in aliases.split(",") if a.strip())
+        else:
+            aliases = ""
+        so = _num_or_none(r.get("sort_order"))
         payload.append({
             "category": cat,
-            "aliases": aliases or "",
+            "aliases": aliases,
             "is_cogs": bool(r.get("is_cogs", True)),
-            "green_pct": r.get("green_pct"),
-            "red_pct": r.get("red_pct"),
-            "sort_order": r.get("sort_order") if r.get("sort_order") is not None else (i + 1) * 10,
+            "green_pct": _num_or_none(r.get("green_pct")),
+            "red_pct": _num_or_none(r.get("red_pct")),
+            "sort_order": int(so) if so is not None else (i + 1) * 10,
         })
     if payload:
         sb.table("suppliers").insert(payload).execute()

@@ -20,7 +20,7 @@ DEFAULT_SUPPLIERS = [
     {"category": "Chicken",   "aliases": ["baiada", "bpl", "baida"],        "is_cogs": True,  "green_pct": 0.13, "red_pct": 0.135, "sort_order": 10},
     {"category": "Meat",      "aliases": ["butcher", "meat"],               "is_cogs": True,  "green_pct": None, "red_pct": None,  "sort_order": 20},
     {"category": "Veggies",   "aliases": ["produce", "veg", "fruit"],       "is_cogs": True,  "green_pct": 0.08, "red_pct": 0.085, "sort_order": 30},
-    {"category": "Seafood",   "aliases": ["seafood", "fish", "seas"],       "is_cogs": True,  "green_pct": None, "red_pct": None,  "sort_order": 40},
+    {"category": "Blueseas (Broadline)", "aliases": ["blueseas", "blue seas", "broadline"], "is_cogs": True, "green_pct": 0.098, "red_pct": 0.102, "sort_order": 40},
     {"category": "Drinks",    "aliases": ["coca", "amatil", "drinks"],      "is_cogs": True,  "green_pct": None, "red_pct": None,  "sort_order": 50},
     {"category": "Groceries", "aliases": ["bidfood", "pfd", "grocery"],     "is_cogs": True,  "green_pct": None, "red_pct": None,  "sort_order": 60},
     {"category": "Packaging", "aliases": ["packaging", "paper", "cleaning"],"is_cogs": False, "green_pct": None, "red_pct": None,  "sort_order": 70},
@@ -193,3 +193,80 @@ def baida_recommended(weekly_sales):
             t = (weekly_sales - s0) / (s1 - s0)
             return (b0 + t * (b1 - b0), sp0 + t * (sp1 - sp0))
     return (float(g[-1][1]), float(g[-1][2]))
+
+
+# ---- Veggie price tracker ----
+# The category whose line-item prices the Veggie tab tracks over time. The tracker groups
+# by the (normalised) line description, so it needs no per-item list — it learns the items
+# from the invoices themselves. Rename if a store calls its produce category something else.
+VEGGIES_SUPPLIER = "Veggies"
+
+
+# ---- Blueseas (broadline) order guide ----
+# Blueseas is a broadline distributor (hundreds of SKUs); the order guide tracks only the
+# highest-volume "main" items where over-ordering moves the COGS needle. The category that
+# holds Blueseas invoices is BLUESEAS_SUPPLIER (rename if a store names it differently).
+# Each main item is keyword-matched against the printed description; first match wins, so
+# list more specific names first.
+BLUESEAS_SUPPLIER = "Blueseas (Broadline)"
+BLUESEAS_MAINS = {
+    "Chips":               ["chips"],
+    "Sweet Potato Wedges": ["sweet potato"],
+    "Salmon":              ["salmon"],
+    "Cream":               ["cream"],
+    "Soya Beans":          ["soya"],
+    "Chicken Wings":       ["wings"],
+    "Breadcrumbs":         ["breadcrumb"],
+    "Tomato Sauce":        ["tomato sauce"],
+    "Mayo":                ["mayo"],
+    "Cottonseed Oil":      ["cottonseed"],
+    "Mozzarella":          ["mozz"],
+    "Milk":                ["milk"],
+}
+
+
+def blueseas_main(description) -> str | None:
+    """Match a Blueseas line to a tracked main item (first match wins); None otherwise."""
+    d = (description or "").lower()
+    for name, kws in BLUESEAS_MAINS.items():
+        if any(k in d for k in kws):
+            return name
+    return None
+
+
+# ---- Drinks order pad ----
+# Baseline order quantities PER WEEK (Coca-Cola Amatil range). The Drinks ordering tab
+# scales these by how many days the order needs to cover (qty x days/7), and nets off any
+# on-hand the user enters. Edit per store as the range/usage changes.
+DRINKS_SUPPLIER = "Drinks"
+DRINKS_WEEKLY = [
+    ("Coke 390ml", 6),
+    ("Coke Zero 390ml", 7),
+    ("Diet Coke 390ml", 2),
+    ("Sprite 390ml", 2),
+    ("Fanta 390ml", 2),
+    ("Coke 600ml", 5),
+    ("Coke Zero 600ml", 6),
+    ("Diet Coke 600ml", 3),
+    ("Vanilla Coke Zero 600ml", 2),
+    ("Fanta 600ml", 3),
+    ("Sprite 600ml", 3),
+    ("Sprite Zero 600ml", 2),
+    ("Fanta Lemon 600ml", 2),
+    ("Pasito 600ml", 2),
+    ("Sparkling Water", 2),
+    ("Water", 7),
+    ("Peach Fuze Tea", 2),
+    ("Lemon Fuze Tea", 2),
+    ("Mango Fuze Tea", 2),
+    ("Purple Powerade", 2),
+    ("Blue Powerade", 2),
+    ("Yellow Powerade", 2),
+    ("Red Powerade", 2),
+    ("Orange Powerade", 2),
+    ("Coke 1.25L", 2),
+    ("Coke Zero 1.25L", 2),
+    ("Water 1.5L", 2),
+    ("Apple Juice", 2),
+    ("Orange Juice", 2),
+]

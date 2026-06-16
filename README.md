@@ -12,7 +12,7 @@ automated ingest.
 ## What's here
 | File | Purpose |
 |---|---|
-| `app.py` | The Streamlit app — 5 tabs: Dashboard, Add invoice, Daily takings, Invoices, Settings |
+| `app.py` | The Streamlit app — 7 tabs: Dashboard, Add invoice, Daily takings, Invoices, Veggie prices, Ordering (Blueseas guide + drinks pad), Settings |
 | `config.py` | Reads supplier categories + targets from the DB (edited in Settings) |
 | `storage.py` | Supabase read/write (5 tables) |
 | `extract.py` | Claude Vision invoice + POS-slip reading |

@@ -4,7 +4,9 @@ Revenue comes from the daily-takings slips (pos_days): ex-GST takings, after net
 the delivery-platform commission. COGS comes from invoices (ex-GST), counting only
 categories flagged is_cogs (so packaging/cleaning are tracked but excluded from the %).
 """
+import re
 import json
+import datetime as dt
 import pandas as pd
 import config
 
@@ -163,3 +165,170 @@ def period_keys(inv_df, pos_df, mode) -> list:
         if df is not None and not df.empty and col in df:
             keys.update(df[col].dropna().unique().tolist())
     return sorted(keys, reverse=True)
+
+
+# ============ Price tracking (veggies / any category) ============
+def _group_price(g):
+    """Per-group (item × date) price summary {amount, qty, unit_price}. Prefers the printed
+    per-unit price (qty-weighted) when present (authoritative for per-kg items), else
+    sum(amount)/sum(quantity)."""
+    q = pd.to_numeric(g["quantity"], errors="coerce")
+    a = pd.to_numeric(g["amount"], errors="coerce")
+    u = pd.to_numeric(g.get("unit_price"), errors="coerce") if "unit_price" in g \
+        else pd.Series(index=g.index, dtype=float)
+    tq = float(q[q > 0].sum()) if q.notna().any() else 0.0
+    ta = float(a.fillna(0).sum())
+    printed = u.notna() & (u > 0) & q.notna() & (q > 0)
+    if printed.any():
+        w = q[printed]
+        up = float((u[printed] * w).sum() / w.sum())
+    else:
+        up = ta / tq if tq > 0 else ta
+    return pd.Series({"amount": ta, "qty": tq, "unit_price": up})
+
+
+def _item_key(desc):
+    """Normalise a line description so the same product groups across invoices."""
+    s = re.sub(r"\s+", " ", str(desc or "").strip().lower())
+    return s or None
+
+
+def category_price_history(lines, category):
+    """Long df [item, date, unit_price, qty] — weighted per-unit price per (normalised
+    item, date) for one supplier category. Learns the item list from the invoices."""
+    cols = ["item", "date", "unit_price", "qty"]
+    if lines is None or lines.empty:
+        return pd.DataFrame(columns=cols)
+    sub = lines[lines["supplier"] == category].copy()
+    sub["item"] = sub["description"].map(_item_key)
+    sub["qnum"] = pd.to_numeric(sub["quantity"], errors="coerce")
+    sub = sub[sub["item"].notna() & sub["invoice_date"].notna() & (sub["qnum"] > 0)]
+    if sub.empty:
+        return pd.DataFrame(columns=cols)
+    g = (sub.groupby(["item", "invoice_date"])[["quantity", "amount", "unit_price"]]
+         .apply(_group_price).reset_index().rename(columns={"invoice_date": "date"}))
+    g = g[g["qty"] > 0]
+    return g[cols].sort_values(["item", "date"]).reset_index(drop=True)
+
+
+def price_flux_table(history):
+    """One row per item: latest $/unit, As of, Daily Δ (vs previous buy), Weekly Δ
+    (this ISO week's avg vs prior week's). Sorted by biggest weekly rise first."""
+    cols = ["Item", "Latest $/unit", "As of", "Daily Δ", "Weekly Δ", "_wk_sort"]
+    if history is None or history.empty:
+        return pd.DataFrame(columns=cols[:-1])
+    rows = []
+    for item, sub in history.groupby("item"):
+        sub = sub.sort_values("date")
+        price = float(sub.iloc[-1]["unit_price"])
+        daily, wk_sort = "—", -999.0
+        if len(sub) >= 2 and float(sub.iloc[-2]["unit_price"]):
+            prev = float(sub.iloc[-2]["unit_price"])
+            daily = f"{(price - prev) / prev * 100:+.1f}%"
+        wk = sub.assign(week=pd.to_datetime(sub["date"]).dt.strftime("%G-W%V"))
+        wkavg = wk.groupby("week")["unit_price"].mean().sort_index()
+        weekly = "—"
+        if len(wkavg) >= 2 and wkavg.iloc[-2]:
+            chg = (wkavg.iloc[-1] - wkavg.iloc[-2]) / wkavg.iloc[-2] * 100
+            weekly, wk_sort = f"{chg:+.1f}%", chg
+        rows.append({"Item": item.title(), "Latest $/unit": round(price, 2),
+                     "As of": str(sub.iloc[-1]["date"]), "Daily Δ": daily,
+                     "Weekly Δ": weekly, "_wk_sort": wk_sort})
+    out = pd.DataFrame(rows).sort_values("_wk_sort", ascending=False)
+    return out.drop(columns="_wk_sort").reset_index(drop=True)
+
+
+# ============ Order guide — usage learned from history ============
+def _gross_sales_by_week(pos_df):
+    """{iso_week: gross incl-GST takings}, n_weeks_with_sales, total_gross."""
+    if pos_df is None or pos_df.empty or "iso_week" not in pos_df.columns:
+        return {}, 0, 0.0
+    wk = (pd.to_numeric(pos_df["total_incl_gst"], errors="coerce").fillna(0)
+          .groupby(pos_df["iso_week"].astype(str)).sum())
+    wk = wk[wk > 0]
+    return {k: float(v) for k, v in wk.items()}, int(len(wk)), float(wk.sum())
+
+
+def recent_avg_weekly_sales(pos_df, n=8):
+    """Average gross incl-GST takings over the most recent n weeks that had sales."""
+    wk, _, _ = _gross_sales_by_week(pos_df)
+    if not wk:
+        return 0.0
+    vals = [v for _, v in sorted(wk.items())][-n:]
+    return float(sum(vals) / len(vals)) if vals else 0.0
+
+
+def usage_rate_per_1000(lines, pos_df, classifier, supplier):
+    """Learn each item's usage rate: quantity per $1000 of gross sales, from history.
+    Returns (rate_map {label: per-$1000 rate}, n_weeks, total_gross)."""
+    wk_sales, n_weeks, total_gross = _gross_sales_by_week(pos_df)
+    if not wk_sales or total_gross <= 0 or lines is None or lines.empty:
+        return {}, n_weeks, total_gross
+    sub = lines[(lines["supplier"] == supplier)
+                & (lines["iso_week"].astype(str).isin(wk_sales))].copy()
+    if sub.empty:
+        return {}, n_weeks, total_gross
+    sub["_lab"] = sub["description"].map(classifier)
+    sub = sub[sub["_lab"].notna()]
+    if sub.empty:
+        return {}, n_weeks, total_gross
+    sub["_q"] = pd.to_numeric(sub["quantity"], errors="coerce").fillna(0)
+    g = sub.groupby("_lab")["_q"].sum()
+    return {lab: float(q) / total_gross * 1000 for lab, q in g.items()}, n_weeks, total_gross
+
+
+def _last_unit_prices(sub):
+    out = {}
+    for lab, g in sub.groupby("_lab"):
+        g = g.sort_values("invoice_date")
+        up = pd.to_numeric(g["unit_price"], errors="coerce")
+        if up.notna().any():
+            out[lab] = float(up.dropna().iloc[-1])
+        else:
+            q = pd.to_numeric(g["quantity"], errors="coerce").fillna(0).sum()
+            a = pd.to_numeric(g["amount"], errors="coerce").fillna(0).sum()
+            out[lab] = float(a / q) if q else 0.0
+    return out
+
+
+def order_guide(lines, pos_df, classifier, supplier, period_col_, period_key, gross_sales):
+    """Per-item aimed-vs-actual for one period. aimed = usage rate x this period's gross
+    sales; actual = quantity ordered this period. Returns (DataFrame, n_weeks)."""
+    rate, n_weeks, _ = usage_rate_per_1000(lines, pos_df, classifier, supplier)
+    cols = ["Item", "Aimed", "Actual", "Diff", "Over %", "~$ over", "$/unit"]
+    sub = (lines[(lines["supplier"] == supplier) & (lines[period_col_] == period_key)].copy()
+           if lines is not None and not lines.empty else pd.DataFrame())
+    actual, prices = {}, {}
+    if not sub.empty:
+        sub["_lab"] = sub["description"].map(classifier)
+        sub = sub[sub["_lab"].notna()]
+        if not sub.empty:
+            sub["_q"] = pd.to_numeric(sub["quantity"], errors="coerce").fillna(0)
+            actual = sub.groupby("_lab")["_q"].sum().to_dict()
+            prices = _last_unit_prices(sub)
+    rows = []
+    for lab in sorted(set(rate) | set(actual)):
+        aim = round(rate.get(lab, 0.0) * (gross_sales or 0) / 1000, 1)
+        act = round(float(actual.get(lab, 0.0)), 1)
+        diff = round(act - aim, 1)
+        over = round(diff / aim * 100, 0) if aim > 0 else (100.0 if act > 0 else 0.0)
+        dollar = round(diff * prices.get(lab, 0.0), 0) if diff > 0 else 0.0
+        rows.append({"Item": lab, "Aimed": aim, "Actual": act, "Diff": diff,
+                     "Over %": over, "~$ over": dollar, "$/unit": round(prices.get(lab, 0.0), 2)})
+    df = pd.DataFrame(rows, columns=cols)
+    if not df.empty:
+        df = df.sort_values(["~$ over", "Diff"], ascending=False).reset_index(drop=True)
+    return df, n_weeks
+
+
+def category_weekly_spend(df, category, n=8):
+    """[Week, Spend] ex-GST for a category over the most recent n ISO weeks (trend)."""
+    if df is None or df.empty or "iso_week" not in df:
+        return pd.DataFrame(columns=["Week", "Spend"])
+    sub = df[df["supplier"] == category]
+    if sub.empty:
+        return pd.DataFrame(columns=["Week", "Spend"])
+    g = (pd.to_numeric(sub["total_ex_gst"], errors="coerce").fillna(0)
+         .groupby(sub["iso_week"].astype(str)).sum().sort_index())
+    g = g.tail(n)
+    return pd.DataFrame({"Week": g.index, "Spend": g.values})

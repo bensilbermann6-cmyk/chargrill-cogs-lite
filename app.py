@@ -17,6 +17,7 @@ from string import Template
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
+import plotly.express as px
 
 st.set_page_config(page_title="COGS Lite", page_icon="📊", layout="wide")
 
@@ -289,8 +290,19 @@ if st.button(_toggle_label, key="theme_toggle", help="Toggle light / dark mode")
     st.session_state["theme"] = "dark" if THEME == "light" else "light"
     st.rerun()
 
-tab_dash, tab_inv, tab_pos, tab_list, tab_set = st.tabs(
-    ["📊 Dashboard", "📸 Add invoice", "💰 Daily takings", "📋 Invoices", "⚙️ Settings"])
+tab_dash, tab_inv, tab_pos, tab_list, tab_veg, tab_order, tab_set = st.tabs(
+    ["📊 Dashboard", "📸 Add invoice", "💰 Daily takings", "📋 Invoices",
+     "🥬 Veggie prices", "📦 Ordering", "⚙️ Settings"])
+
+
+def _bare_fig(fig, h=320):
+    """Strip a plotly figure to the app's transparent, gridless-ish look."""
+    fig.update_layout(height=h, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                      font_color=T["muted"], margin=dict(l=10, r=10, t=10, b=10),
+                      legend=dict(orientation="h", y=-0.2))
+    fig.update_xaxes(gridcolor=T["border"], zerolinecolor=T["border"])
+    fig.update_yaxes(gridcolor=T["border"], zerolinecolor=T["border"])
+    return fig
 
 
 # ============================ Dashboard ============================
@@ -760,6 +772,120 @@ with tab_list:
                 st.rerun()
         else:
             st.caption("No invoices match the current filter.")
+
+
+# ============================ Veggie price tracker ============================
+with tab_veg:
+    st.markdown("#### 🥬 Veggie price tracker")
+    _inv = c_invoices()
+    _lines = metrics.explode_lines(_inv)
+    _cats = [s["category"] for s in config.suppliers()]
+    _default = config.VEGGIES_SUPPLIER if config.VEGGIES_SUPPLIER in _cats else (_cats[0] if _cats else "Veggies")
+    cat = st.selectbox("Category to track", _cats,
+                       index=_cats.index(_default) if _default in _cats else 0)
+    st.caption("Unit price = the printed per-unit price (per-kg when shown), else line total ÷ "
+               "quantity. Items are learned from the invoices — upload more to build history.")
+    hist = metrics.category_price_history(_lines, cat)
+    if hist.empty:
+        st.info(f"No priced **{cat}** lines yet — add {cat} invoices in **📸 Add invoice**.")
+    else:
+        st.dataframe(metrics.price_flux_table(hist), hide_index=True, use_container_width=True)
+        items = sorted(hist["item"].unique())
+        pick = st.multiselect("Plot price history for:", [i.title() for i in items],
+                              default=[i.title() for i in items[:5]])
+        wanted = {p.lower() for p in pick}
+        plot = hist[hist["item"].isin([i for i in items if i in wanted])].copy()
+        if not plot.empty:
+            plot["item"] = plot["item"].str.title()
+            plot["date"] = pd.to_datetime(plot["date"])
+            fig = px.line(plot, x="date", y="unit_price", color="item", markers=True)
+            fig.update_yaxes(title="$ / unit")
+            fig.update_xaxes(title="")
+            st.plotly_chart(_bare_fig(fig, 360), use_container_width=True,
+                            config={"displayModeBar": False})
+
+
+# ============================ Ordering ============================
+with tab_order:
+    st.markdown("#### 📦 Ordering")
+    _inv = c_invoices()
+    _pos = c_pos_days()
+    _lines = metrics.explode_lines(_inv)
+    o_bs, o_dr = st.tabs([f"🐟 {config.BLUESEAS_SUPPLIER}", "🥤 Drinks"])
+
+    # ---- Blueseas: usage learned from history → recommended order + over-order flags ----
+    with o_bs:
+        rate, n_weeks, _gross = metrics.usage_rate_per_1000(
+            _lines, _pos, config.blueseas_main, config.BLUESEAS_SUPPLIER)
+        st.caption("Learns each main item's usage per $ of takings from your history, then "
+                   "recommends how much to order for the week's expected sales — so the order "
+                   "tracks demand and stays inside the COGS target band.")
+        if n_weeks == 0:
+            st.info("Enter daily takings and upload Blueseas invoices — the guide starts learning "
+                    "immediately and sharpens each week.")
+        else:
+            if n_weeks < 4:
+                st.caption(f"📈 Learning — based on {n_weeks} week(s) so far; recommendations firm up "
+                           "as more weeks land.")
+            avg_wk = metrics.recent_avg_weekly_sales(_pos)
+            proj = st.number_input("Project for weekly sales (incl GST)", min_value=0.0, step=500.0,
+                                   value=float(round(avg_wk / 100) * 100),
+                                   help="Defaults to your recent 8-week average takings.")
+            rec = [{"Item": lab, "Recommended": round(r * proj / 1000, 1)}
+                   for lab, r in sorted(rate.items(), key=lambda kv: -kv[1])]
+            if rec:
+                st.markdown(f"**Recommended order for ~${proj:,.0f} sales**")
+                st.dataframe(pd.DataFrame(rec), hide_index=True, use_container_width=True)
+
+            gross_period = (float(pd.to_numeric(_pos[_pos[p_col] == period_key]["total_incl_gst"],
+                                                errors="coerce").fillna(0).sum())
+                            if (not _pos.empty and p_col in _pos) else 0.0)
+            guide, _ = metrics.order_guide(_lines, _pos, config.blueseas_main,
+                                           config.BLUESEAS_SUPPLIER, p_col, period_key, gross_period)
+            st.markdown(f"**Aimed vs actual — {period_label}**")
+            if guide.empty:
+                st.caption("No Blueseas lines this period.")
+            else:
+                st.dataframe(guide, hide_index=True, use_container_width=True)
+                tot_over = float(guide[guide["Diff"] > 0]["~$ over"].sum())
+                if tot_over > 0:
+                    st.warning(f"🔴 ~${tot_over:,.0f} over the usage-based aim this period — "
+                               "trim the items at the top to pull COGS back toward target.")
+                else:
+                    st.success("✅ In line with usage for this period's sales.")
+
+            trend = metrics.category_weekly_spend(_inv, config.BLUESEAS_SUPPLIER, n=8)
+            if not trend.empty and len(trend) >= 2:
+                st.markdown("**Weekly spend trend**")
+                fig = px.bar(trend, x="Week", y="Spend")
+                fig.update_yaxes(title="$ ex-GST")
+                fig.update_xaxes(title="")
+                st.plotly_chart(_bare_fig(fig, 240), use_container_width=True,
+                                config={"displayModeBar": False})
+
+    # ---- Drinks: per-week baseline scaled to the order's coverage, less on-hand ----
+    with o_dr:
+        st.caption("Baseline is per week. Set how many days this order needs to cover and the "
+                   "quantities scale (per-week × days ÷ 7). Enter on-hand to net it off.")
+        days = st.number_input("Days this order covers", min_value=1, max_value=28, value=7, step=1,
+                               help="7 = a normal weekly order; use fewer if you order more often.")
+        base = pd.DataFrame(config.DRINKS_WEEKLY, columns=["Item", "Per week"])
+        base["On hand"] = 0
+        ed = st.data_editor(
+            base, hide_index=True, use_container_width=True, key="drinks_ed",
+            column_config={
+                "Per week": st.column_config.NumberColumn("Per week", disabled=True),
+                "On hand": st.column_config.NumberColumn("On hand", min_value=0, step=1),
+            })
+        ed = ed.copy()
+        ed["Target"] = (pd.to_numeric(ed["Per week"], errors="coerce").fillna(0) * days / 7.0
+                        ).round().astype(int)
+        ed["Order"] = (ed["Target"] - pd.to_numeric(ed["On hand"], errors="coerce").fillna(0)
+                       ).clip(lower=0).astype(int)
+        st.markdown(f"**Recommended order — covers {days} day(s)**")
+        st.dataframe(ed[["Item", "Per week", "Target", "On hand", "Order"]],
+                     hide_index=True, use_container_width=True)
+        st.caption(f"Total units to order: **{int(ed['Order'].sum())}**")
 
 
 # ============================ Settings ============================

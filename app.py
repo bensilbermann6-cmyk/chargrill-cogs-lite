@@ -251,7 +251,7 @@ with st.sidebar:
     st.markdown(f"<div class='brand'><div><div class='brand-name'>{config.store_name()}</div>"
                 f"<div class='brand-sub'>COGS Lite</div></div></div>", unsafe_allow_html=True)
     st.write("")
-    mode = st.radio("View", ["Month", "Week"], horizontal=True)
+    mode = st.radio("View", ["Week", "Month"], horizontal=True)  # Week is the default view
     nav = st.columns(3)
     if nav[0].button("◀ Prev", use_container_width=True):
         r = st.session_state["period_ref"]
